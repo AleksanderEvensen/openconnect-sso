@@ -5,6 +5,21 @@ to Cisco SSL-VPNs
 
 ## Installation
 
+OpenConnect is required before running this tool
+
+### MacOS
+
+```sh
+brew install openconnect
+```
+
+### Windows Linux
+
+On your own check out this link: https://www.infradead.org/openconnect/download.html
+
+
+### Install dependencies
+
 ```sh
 uv sync
 ```
