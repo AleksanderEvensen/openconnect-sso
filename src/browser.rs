@@ -1,4 +1,9 @@
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(not(target_os = "macos"))]
+use std::{env, fs, path::PathBuf};
+
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::{Context, Result, anyhow};
 use reqwest::Url;
 use tao::{
     dpi::LogicalSize,
@@ -7,16 +12,26 @@ use tao::{
     platform::run_return::EventLoopExtRunReturn,
     window::WindowBuilder,
 };
-use wry::{
-    NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder, WebViewBuilderExtDarwin,
-    WebViewExtDarwin,
-};
+#[cfg(not(target_os = "macos"))]
+use wry::WebContext;
+use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 
+#[cfg(target_os = "macos")]
+use wry::{WebViewBuilderExtDarwin, WebViewExtDarwin};
+#[cfg(target_os = "linux")]
+use {tao::platform::unix::WindowExtUnix, wry::WebViewBuilderExtUnix};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("openconnect-sso supports Linux, macOS, and Windows");
+
+#[cfg(target_os = "macos")]
 const DATA_STORE_ID: [u8; 16] = *b"openconnect-sso!";
 
 enum BrowserEvent {
     Loaded(String),
+    #[cfg(target_os = "macos")]
     DataStores(Vec<[u8; 16]>),
+    #[cfg(target_os = "macos")]
     DataStoreRemoved(Result<(), String>),
 }
 
@@ -27,9 +42,13 @@ pub fn authenticate(
     clear_browser_data: bool,
 ) -> Result<String> {
     let mut event_loop = EventLoopBuilder::<BrowserEvent>::with_user_event().build();
+
+    #[cfg(target_os = "macos")]
     if clear_browser_data {
         clear_data_store(&mut event_loop)?;
     }
+    #[cfg(not(target_os = "macos"))]
+    let mut web_context = persistent_context(clear_browser_data)?;
 
     let proxy = event_loop.create_proxy();
     let window = WindowBuilder::new()
@@ -39,15 +58,30 @@ pub fn authenticate(
         .context("failed to create authentication window")?;
     let window_id = window.id();
 
-    let webview = WebViewBuilder::new()
-        .with_data_store_identifier(DATA_STORE_ID)
+    #[cfg(target_os = "macos")]
+    let builder = WebViewBuilder::new().with_data_store_identifier(DATA_STORE_ID);
+    #[cfg(not(target_os = "macos"))]
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context);
+
+    let builder = builder
         .with_url(login_url.as_str())
         .with_on_page_load_handler(move |event, url| {
             if matches!(event, PageLoadEvent::Finished) {
                 let _ = proxy.send_event(BrowserEvent::Loaded(url));
             }
         })
-        .with_new_window_req_handler(|_, _| NewWindowResponse::Allow)
+        .with_new_window_req_handler(|_, _| NewWindowResponse::Allow);
+
+    #[cfg(target_os = "linux")]
+    let webview = builder
+        .build_gtk(
+            window
+                .default_vbox()
+                .context("authentication window has no GTK container")?,
+        )
+        .context("failed to create authentication browser")?;
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder
         .build(&window)
         .context("failed to create authentication browser")?;
 
@@ -83,6 +117,40 @@ pub fn authenticate(
     result.unwrap_or_else(|| Err(anyhow!("authentication browser exited unexpectedly")))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn persistent_context(clear_browser_data: bool) -> Result<WebContext> {
+    let path = browser_data_directory()?;
+    if clear_browser_data && path.exists() {
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("failed to clear browser data at {}", path.display()))?;
+    }
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create browser data directory {}", path.display()))?;
+    Ok(WebContext::new(Some(path)))
+}
+
+#[cfg(target_os = "linux")]
+fn browser_data_directory() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path).join("openconnect-sso/webview"));
+    }
+    Ok(PathBuf::from(
+        env::var_os("HOME")
+            .context("neither XDG_DATA_HOME nor HOME is set; cannot persist browser data")?,
+    )
+    .join(".local/share/openconnect-sso/webview"))
+}
+
+#[cfg(target_os = "windows")]
+fn browser_data_directory() -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set; cannot persist browser data")?,
+    )
+    .join("openconnect-sso/webview"))
+}
+
+#[cfg(target_os = "macos")]
 fn clear_data_store(event_loop: &mut tao::event_loop::EventLoop<BrowserEvent>) -> Result<()> {
     let proxy = event_loop.create_proxy();
     WebView::fetch_data_store_identifiers(move |identifiers| {
