@@ -15,39 +15,45 @@ Cisco AnyConnect SSO-v2 authentication for OpenConnect. It opens the VPN provide
 
 ```sh
 brew install openconnect
-cargo install --path .
 ```
 
 ### Ubuntu/Debian
 
 ```sh
 sudo apt install openconnect libwebkit2gtk-4.1-dev build-essential pkg-config
-cargo install --path .
 ```
 
 ### Fedora
 
 ```sh
 sudo dnf install openconnect webkit2gtk4.1-devel gtk3-devel gcc pkgconf-pkg-config
-cargo install --path .
 ```
 
 ### Arch Linux
 
 ```sh
 sudo pacman -S openconnect webkit2gtk-4.1 base-devel
-cargo install --path .
 ```
 
 ### Windows
 
-Install Rust and the [official OpenConnect Windows package](https://www.infradead.org/openconnect/packages.html), ensure `openconnect.exe` is in `PATH`, then run:
-
-```powershell
-cargo install --path .
-```
+Install Rust and the [official OpenConnect Windows package](https://www.infradead.org/openconnect/packages.html), and ensure `openconnect.exe` is in `PATH`.
 
 OpenConnect needs Administrator privileges to configure the tunnel. Run `openconnect-sso` from a terminal started with **Run as administrator**.
+
+## Installation
+
+Install the latest version directly from GitHub:
+
+```sh
+cargo install --git https://github.com/AleksanderEvensen/openconnect-sso.git --locked
+```
+
+Alternatively, install a local checkout:
+
+```sh
+cargo install --path . --locked
+```
 
 ## Usage
 
