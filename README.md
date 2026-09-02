@@ -58,25 +58,25 @@ cargo install --path . --locked
 ## Usage
 
 ```sh
-openconnect-sso --server vpn.ntnu.no
+openconnect-sso connect vpn.ntnu.no
 ```
 
 Arguments after `--` are passed unchanged to OpenConnect:
 
 ```sh
-openconnect-sso --server vpn.ntnu.no -- --no-dtls --verbose
+openconnect-sso connect vpn.ntnu.no -- --no-dtls --verbose
 ```
 
 Force a fresh browser session:
 
 ```sh
-openconnect-sso --server vpn.ntnu.no --clear-browser-data
+openconnect-sso connect vpn.ntnu.no --clear-browser-data
 ```
 
 Only HTTPS endpoints are accepted by default. For local testing, HTTP must be both explicit and deliberately enabled:
 
 ```sh
-openconnect-sso --server http://vpn.example.test --allow-http-endpoint
+openconnect-sso connect http://vpn.example.test --allow-http-endpoint
 ```
 
 The application does not collect or store passwords. The platform browser persists its own cookies and site data so existing identity-provider sessions can be reused:

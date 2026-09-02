@@ -9,6 +9,7 @@ repository = "https://github.com/AleksanderEvensen/openconnect-sso"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
+indoc = "2.0.7"
 reqwest = { version = "0.13.4", features = ["blocking", "cookies"] }
 tao = "0.36.0"
 wry = "0.56.1"

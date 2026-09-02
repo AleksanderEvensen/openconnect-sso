@@ -1,9 +1,8 @@
+use std::process::Command;
 #[cfg(not(target_os = "macos"))]
 use std::{env, fs, path::PathBuf};
 
-#[cfg(target_os = "macos")]
-use anyhow::bail;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::Url;
 use tao::{
     dpi::LogicalSize,
@@ -27,8 +26,11 @@ compile_error!("openconnect-sso supports Linux, macOS, and Windows");
 #[cfg(target_os = "macos")]
 const DATA_STORE_ID: [u8; 16] = *b"openconnect-sso!";
 
+pub(crate) const CHILD_COMMAND: &str = "__internal-browser-auth";
+
 enum BrowserEvent {
     Loaded(String),
+    Open(String),
     #[cfg(target_os = "macos")]
     DataStores(Vec<[u8; 16]>),
     #[cfg(target_os = "macos")]
@@ -36,6 +38,40 @@ enum BrowserEvent {
 }
 
 pub fn authenticate(
+    login_url: Url,
+    final_url: Url,
+    cookie_name: &str,
+    clear_browser_data: bool,
+) -> Result<String> {
+    let mut command = Command::new(std::env::current_exe().context("failed to locate executable")?);
+    command
+        .arg(CHILD_COMMAND)
+        .arg(login_url.as_str())
+        .arg(final_url.as_str())
+        .arg(cookie_name);
+    if clear_browser_data {
+        command.arg("--clear-browser-data");
+    }
+
+    let output = command
+        .output()
+        .context("failed to start authentication browser process")?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        bail!("authentication browser failed: {}", error.trim());
+    }
+
+    let token = String::from_utf8(output.stdout).context("authentication token is not UTF-8")?;
+    let token = token.trim_end().to_owned();
+    ensure!(
+        !token.is_empty(),
+        "authentication browser returned no token"
+    );
+    Ok(token)
+}
+
+pub(crate) fn authenticate_in_process(
     login_url: Url,
     final_url: Url,
     cookie_name: &str,
@@ -50,7 +86,6 @@ pub fn authenticate(
     #[cfg(not(target_os = "macos"))]
     let mut web_context = persistent_context(clear_browser_data)?;
 
-    let proxy = event_loop.create_proxy();
     let window = WindowBuilder::new()
         .with_title("OpenConnect SSO")
         .with_inner_size(LogicalSize::new(900, 700))
@@ -63,14 +98,21 @@ pub fn authenticate(
     #[cfg(not(target_os = "macos"))]
     let builder = WebViewBuilder::new_with_web_context(&mut web_context);
 
+    let load_proxy = event_loop.create_proxy();
+    let open_proxy = event_loop.create_proxy();
     let builder = builder
         .with_url(login_url.as_str())
         .with_on_page_load_handler(move |event, url| {
             if matches!(event, PageLoadEvent::Finished) {
-                let _ = proxy.send_event(BrowserEvent::Loaded(url));
+                let _ = load_proxy.send_event(BrowserEvent::Loaded(url));
             }
         })
-        .with_new_window_req_handler(|_, _| NewWindowResponse::Allow);
+        // Default popup windows are owned by the platform webview and can outlive
+        // this authentication window. Keep the entire login flow in one window.
+        .with_new_window_req_handler(move |url, _| {
+            let _ = open_proxy.send_event(BrowserEvent::Open(url));
+            NewWindowResponse::Deny
+        });
 
     #[cfg(target_os = "linux")]
     let webview = builder
@@ -85,18 +127,34 @@ pub fn authenticate(
         .build(&window)
         .context("failed to create authentication browser")?;
 
+    let mut window = Some(window);
+    let mut webview = Some(webview);
     let mut result = None;
     event_loop.run_return(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
+            Event::UserEvent(BrowserEvent::Open(url)) => {
+                let Some(browser) = webview.as_ref() else {
+                    return;
+                };
+                if let Err(error) = browser.load_url(&url) {
+                    result = Some(Err(error).context("failed to open authentication page"));
+                    drop(webview.take());
+                    drop(window.take());
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
             Event::UserEvent(BrowserEvent::Loaded(url)) => {
                 let loaded_url = match Url::parse(&url) {
                     Ok(url) => url,
                     Err(_) => return,
                 };
                 if loaded_url == final_url {
-                    result = Some(find_cookie(&webview, &final_url, cookie_name));
-                    window.set_visible(false);
+                    result = webview
+                        .as_ref()
+                        .map(|browser| find_cookie(browser, &final_url, cookie_name));
+                    drop(webview.take());
+                    drop(window.take());
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -106,6 +164,8 @@ pub fn authenticate(
                 ..
             } if closed_window == window_id => {
                 result = Some(Err(anyhow!("authentication cancelled")));
+                drop(webview.take());
+                drop(window.take());
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}
@@ -114,6 +174,10 @@ pub fn authenticate(
 
     drop(webview);
     drop(window);
+    #[cfg(not(target_os = "macos"))]
+    drop(web_context);
+    drop(event_loop);
+
     result.unwrap_or_else(|| Err(anyhow!("authentication browser exited unexpectedly")))
 }
 

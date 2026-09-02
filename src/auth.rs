@@ -1,13 +1,14 @@
 use std::io::Cursor;
 
 use anyhow::{Context, Result, bail, ensure};
+use indoc::formatdoc;
 use reqwest::{
     Url,
     blocking::Client,
     header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
     redirect::Policy,
 };
-use xmltree::{Element, EmitterConfig, XMLNode};
+use xmltree::{Element, EmitterConfig};
 
 use crate::browser;
 
@@ -24,25 +25,7 @@ struct AuthRequest {
     login_url: Url,
     final_url: Url,
     token_cookie_name: String,
-    opaque: Element,
-}
-
-pub fn server_url(value: &str, allow_http: bool) -> Result<Url> {
-    let url = if value.contains("://") {
-        Url::parse(value).context("invalid --server URL")?
-    } else {
-        Url::parse(&format!("https://{value}")).context("invalid --server hostname")?
-    };
-    ensure_allowed_url(&url, allow_http, "server endpoint")?;
-    ensure!(
-        url.host_str().is_some(),
-        "server URL must contain a hostname"
-    );
-    ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "credentials are not allowed in the server URL"
-    );
-    Ok(url)
+    opaque: String,
 }
 
 pub fn authenticate(
@@ -50,33 +33,39 @@ pub fn authenticate(
     allow_http: bool,
     clear_browser_data: bool,
 ) -> Result<Authenticated> {
-    let endpoint = Client::builder()
+    let client = Client::builder()
         .redirect(redirect_policy(allow_http))
         .build()
-        .context("failed to initialize endpoint discovery")?
+        .context("failed to initialize endpoint discovery")?;
+
+    let response = client
         .get(server)
         .send()
-        .context("failed to reach VPN server")?
+        .context("faile to reach VPN server")?
         .error_for_status()
-        .context("VPN server rejected endpoint discovery")?
-        .url()
-        .clone();
+        .context("VPN server returned with a 4xx/5xx response code")?;
+
+    // Final endpoint to connect using openconnect
+    let endpoint = response.url().clone();
+
+    // Is this endpoint valid in withour current options
     ensure_allowed_url(&endpoint, allow_http, "redirected server endpoint")?;
 
     let client = http_client(allow_http)?;
-    let init = auth_init_xml(endpoint.as_str())?;
-    let request = parse_auth_request(post_xml(&client, &endpoint, init)?, allow_http)?;
+    let init = auth_init_xml(endpoint.as_str());
+
+    let auth_request = parse_auth_request(post_xml(&client, &endpoint, init)?, allow_http)?;
 
     let sso_token = browser::authenticate(
-        request.login_url,
-        request.final_url,
-        &request.token_cookie_name,
+        auth_request.login_url,
+        auth_request.final_url,
+        &auth_request.token_cookie_name,
         clear_browser_data,
     )?;
 
-    let finish = auth_finish_xml(request.opaque, &sso_token)?;
+    let finish = auth_finish_xml(auth_request.opaque, &sso_token);
     let (session_token, server_cert_hash) =
-        parse_auth_complete(post_xml(&client, &endpoint, finish)?)?;
+        parse_auth_complete(post_xml(&client, &endpoint, finish.clone())?)?;
 
     Ok(Authenticated {
         server: endpoint,
@@ -129,79 +118,126 @@ fn post_xml(client: &Client, endpoint: &Url, body: Vec<u8>) -> Result<Vec<u8>> {
         .to_vec())
 }
 
-fn auth_init_xml(endpoint: &str) -> Result<Vec<u8>> {
-    let mut root = element("config-auth", None);
-    root.attributes.insert("client".into(), "vpn".into());
-    root.attributes.insert("type".into(), "init".into());
-    root.attributes
-        .insert("aggregate-auth-version".into(), "2".into());
+fn auth_init_xml(endpoint: &str) -> Vec<u8> {
+    return formatdoc! {r#"
+        <?xml version="1.0" encoding="UTF-8"?>
+        <config-auth type="init" aggregate-auth-version="2" client="vpn">
+            <version who="vpn">{anyconnect_version}</version>
+            <device-id>linux-64</device-id>
 
-    let mut version = element("version", Some(ANYCONNECT_VERSION));
-    version.attributes.insert("who".into(), "vpn".into());
-    push(&mut root, version);
-    push(&mut root, element("device-id", Some("linux-64")));
-    push(&mut root, element("group-select", Some("")));
-    push(&mut root, element("group-access", Some(endpoint)));
+            <group-select></group-select>
+            <group-access>{endpoint}</group-access>
 
-    let mut capabilities = element("capabilities", None);
-    push(
-        &mut capabilities,
-        element("auth-method", Some("single-sign-on-v2")),
-    );
-    push(&mut root, capabilities);
-    write_xml(&root)
+            <capabilities>
+                <auth-method>single-sign-on-v2</auth-method>
+            </capabilities>
+        </config-auth>
+        "#,
+        anyconnect_version = ANYCONNECT_VERSION,
+        endpoint = endpoint
+    }
+    .into_bytes();
 }
 
-fn auth_finish_xml(opaque: Element, sso_token: &str) -> Result<Vec<u8>> {
-    let mut root = element("config-auth", None);
-    root.attributes.insert("client".into(), "vpn".into());
-    root.attributes.insert("type".into(), "auth-reply".into());
-    root.attributes
-        .insert("aggregate-auth-version".into(), "2".into());
+fn auth_finish_xml(opaque: String, sso_token: &str) -> Vec<u8> {
+    return formatdoc! {r#"
+        <?xml version="1.0" encoding="UTF-8"?>
+        <config-auth aggregate-auth-version="2" type="auth-reply" client="vpn">
+            <version who="vpn">4.7.00136</version>
+            <device-id>linux-64</device-id>
 
-    let mut version = element("version", Some(ANYCONNECT_VERSION));
-    version.attributes.insert("who".into(), "vpn".into());
-    push(&mut root, version);
-    push(&mut root, element("device-id", Some("linux-64")));
-    push(&mut root, element("session-token", None));
-    push(&mut root, element("session-id", None));
-    push(&mut root, opaque);
+            <session-token />
+            <session-id />
 
-    let mut auth = element("auth", None);
-    push(&mut auth, element("sso-token", Some(sso_token)));
-    push(&mut root, auth);
-    write_xml(&root)
+            {opaque_element}
+
+            <auth>
+                <sso-token>{sso_token}</sso-token>
+            </auth>
+        </config-auth>
+        "#,
+        opaque_element = opaque,
+        sso_token = sso_token
+    }
+    .into_bytes();
 }
 
 fn parse_auth_request(xml: Vec<u8>, allow_http: bool) -> Result<AuthRequest> {
     let root = parse_xml(xml)?;
+
     ensure!(
         root.attributes.get("type").map(String::as_str) == Some("auth-request"),
         "unsupported Cisco SSO response: expected auth-request"
     );
-    let auth = child(&root, "auth")?;
+
+    let auth_element = root
+        .get_child("auth")
+        .context("Invalid Cisco SSO XML no auth element")?;
+    let opaque_element = root
+        .get_child("opaque")
+        .context("Invalid Cisco SAML xml missing opaque element")?;
+
     ensure!(
-        auth.attributes.get("id").map(String::as_str) == Some("main"),
+        auth_element.attributes.get("id").map(String::as_str) == Some("main"),
         "unsupported Cisco SSO response: expected main authentication form"
     );
-    if let Some(error) = optional_text(auth, "error")
-        && !error.trim().is_empty()
-    {
-        bail!("VPN server refused authentication: {error}");
+
+    match auth_element.get_child("error").and_then(Element::get_text) {
+        Some(error) if !error.trim().is_empty() => {
+            bail!("VPN server refused authentication: {error}")
+        }
+        _ => {}
     }
 
-    let login_url =
-        Url::parse(&required_text(auth, "sso-v2-login")?).context("invalid Cisco SSO login URL")?;
-    let final_url = Url::parse(&required_text(auth, "sso-v2-login-final")?)
-        .context("invalid Cisco SSO final URL")?;
+    let login_url = match auth_element
+        .get_child("sso-v2-login")
+        .and_then(Element::get_text)
+    {
+        Some(url) if !url.is_empty() => {
+            Url::parse(url.as_ref()).context("Invalid Cisco SSO login URL")?
+        }
+        Some(_) => bail!("Cisco SSO Login URL is empty"),
+        None => bail!("No Cisco SSO Login URL found in xml response"),
+    };
+
+    let final_url = match auth_element
+        .get_child("sso-v2-login-final")
+        .and_then(Element::get_text)
+    {
+        Some(url) if !url.is_empty() => {
+            Url::parse(url.as_ref()).context("Invalid Cisco SSO final URL")?
+        }
+        Some(_) => bail!("Cisco SSO final URL is empty"),
+        None => bail!("No Cisco SSO final URL found in xml response"),
+    };
+
     ensure_allowed_url(&login_url, allow_http, "Cisco SSO login URL")?;
     ensure_allowed_url(&final_url, allow_http, "Cisco SSO final URL")?;
+
+    let token_cookie_name = match auth_element
+        .get_child("sso-v2-token-cookie-name")
+        .and_then(Element::get_text)
+        .map(String::from)
+    {
+        Some(name) if !name.is_empty() => name,
+        Some(_) => bail!("Cisco SSO cookie name field was empty"),
+        None => bail!("Cisco SSO cookie name field was not present"),
+    };
+
+    let mut opaque_string_buffer = Vec::new();
+    opaque_element
+        .write_with_config(
+            &mut opaque_string_buffer,
+            EmitterConfig::new().write_document_declaration(false),
+        )
+        .context("failed to serialize opaque element xml to string buffer")?;
 
     Ok(AuthRequest {
         login_url,
         final_url,
-        token_cookie_name: required_text(auth, "sso-v2-token-cookie-name")?,
-        opaque: child(&root, "opaque")?.clone(),
+        token_cookie_name,
+        opaque: String::from_utf8(opaque_string_buffer)
+            .context("Failed to convert the opaque element xml buffer to a string")?,
     })
 }
 
@@ -211,21 +247,44 @@ fn parse_auth_complete(xml: Vec<u8>) -> Result<(String, String)> {
         root.attributes.get("type").map(String::as_str) == Some("complete"),
         "unsupported Cisco SSO response: expected complete"
     );
-    let auth = child(&root, "auth")?;
+    let auth_element = root
+        .get_child("auth")
+        .context("Invalid Cisco SSO XML no auth element")?;
     ensure!(
-        auth.attributes.get("id").map(String::as_str) == Some("success"),
+        auth_element.attributes.get("id").map(String::as_str) == Some("success"),
         "Cisco authentication did not complete successfully"
     );
-    let config = child(&root, "config")?;
-    let vpn_config = child(config, "vpn-base-config")?;
 
-    Ok((
-        required_text(&root, "session-token")?,
-        required_text(vpn_config, "server-cert-hash")?,
-    ))
+    let server_cert_hash = match root
+        .get_child("config")
+        .context("Invalid Cisco SSO XML response no config element")?
+        .get_child("vpn-base-config")
+        .context("Invalid Cisco SSO XML response no config > vpn-base-config element")?
+        .get_child("server-cert-hash")
+        .context("Invalid Cisco SSO XML response no config > vpn-base-config > server-cert-hash")?
+        .get_text()
+        .map(String::from)
+    {
+        Some(text) if !text.is_empty() => text,
+        Some(_) => bail!("Server certificate hash is empty"),
+        None => bail!("Server certificate hash does not have a value"),
+    };
+
+    let session_token = match root
+        .get_child("session-token")
+        .context("Invalid Cisco XML response no session-token")?
+        .get_text()
+        .map(String::from)
+    {
+        Some(text) if !text.is_empty() => text,
+        Some(_) => bail!("Session token is empty"),
+        None => bail!("Session token was not found"),
+    };
+
+    Ok((session_token, server_cert_hash))
 }
 
-fn ensure_allowed_url(url: &Url, allow_http: bool, description: &str) -> Result<()> {
+pub(crate) fn ensure_allowed_url(url: &Url, allow_http: bool, description: &str) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
         "http" if allow_http => Ok(()),
@@ -240,62 +299,15 @@ fn parse_xml(xml: Vec<u8>) -> Result<Element> {
     Element::parse(Cursor::new(xml)).context("unsupported or malformed Cisco SSO response")
 }
 
-fn child<'a>(element: &'a Element, name: &str) -> Result<&'a Element> {
-    element
-        .get_child(name)
-        .with_context(|| format!("unsupported Cisco SSO response: missing <{name}>"))
-}
-
-fn required_text(element: &Element, name: &str) -> Result<String> {
-    optional_text(element, name)
-        .filter(|value| !value.is_empty())
-        .with_context(|| format!("unsupported Cisco SSO response: missing <{name}> value"))
-}
-
-fn optional_text(element: &Element, name: &str) -> Option<String> {
-    element
-        .get_child(name)
-        .and_then(Element::get_text)
-        .map(|value| value.into_owned())
-}
-
-fn element(name: &str, text: Option<&str>) -> Element {
-    let mut element = Element::new(name);
-    if let Some(text) = text {
-        element.children.push(XMLNode::Text(text.into()));
-    }
-    element
-}
-
-fn push(parent: &mut Element, child: Element) {
-    parent.children.push(XMLNode::Element(child));
-}
-
-fn write_xml(element: &Element) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    element
-        .write_with_config(
-            &mut output,
-            EmitterConfig::new()
-                .perform_indent(true)
-                .write_document_declaration(true),
-        )
-        .context("failed to construct Cisco authentication request")?;
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn server_urls_default_to_https_and_require_an_http_override() {
-        assert_eq!(
-            server_url("vpn.example.com", false).unwrap().as_str(),
-            "https://vpn.example.com/"
-        );
-        assert!(server_url("http://vpn.example.com", false).is_err());
-        assert!(server_url("http://vpn.example.com", true).is_ok());
+    fn server_urls_require_an_http_override() {
+        let url = Url::parse("http://vpn.example.com").unwrap();
+        assert!(ensure_allowed_url(&url, false, "server endpoint").is_err());
+        assert!(ensure_allowed_url(&url, true, "server endpoint").is_ok());
     }
 
     #[test]
@@ -308,13 +320,30 @@ mod tests {
 
         assert_eq!(request.token_cookie_name, "token");
         assert_eq!(
-            request
-                .opaque
-                .get_child("tunnel-group")
-                .unwrap()
-                .get_text()
-                .unwrap(),
-            "group"
+            request.opaque,
+            "<opaque><tunnel-group>group</tunnel-group></opaque>"
         );
+    }
+
+    #[test]
+    fn parses_completed_authentication_values() {
+        let (session_token, server_cert_hash) = parse_auth_complete(
+            br#"
+                <config-auth type="complete">
+                    <auth id="success" />
+                    <session-token>session</session-token>
+                    <config>
+                        <vpn-base-config>
+                            <server-cert-hash>sha256:hash</server-cert-hash>
+                        </vpn-base-config>
+                    </config>
+                </config-auth>
+            "#
+            .to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(session_token, "session");
+        assert_eq!(server_cert_hash, "sha256:hash");
     }
 }

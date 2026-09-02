@@ -7,8 +7,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-#[cfg(windows)]
-use anyhow::ensure;
 use anyhow::{Context, Result, bail};
 
 use crate::auth::Authenticated;
@@ -68,7 +66,7 @@ fn elevated_command(openconnect: &Path) -> Result<Command> {
 
 #[cfg(windows)]
 fn elevated_command(openconnect: &Path) -> Result<Command> {
-    ensure!(
+    anyhow::ensure!(
         is_elevated(),
         "OpenConnect requires Administrator privileges; restart this terminal as Administrator"
     );
