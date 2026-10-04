@@ -1,6 +1,9 @@
-use std::process::Command;
 #[cfg(not(target_os = "macos"))]
 use std::{env, fs, path::PathBuf};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::Url;
@@ -9,7 +12,7 @@ use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::run_return::EventLoopExtRunReturn,
-    window::WindowBuilder,
+    window::{Window, WindowBuilder},
 };
 #[cfg(not(target_os = "macos"))]
 use wry::WebContext;
@@ -28,9 +31,19 @@ const DATA_STORE_ID: [u8; 16] = *b"openconnect-sso!";
 
 pub(crate) const CHILD_COMMAND: &str = "__internal-browser-auth";
 
+// Silent single sign-on passes through each page almost immediately. A page that
+// stays put for this long is assumed to be waiting for the user.
+const REVEAL_AFTER_IDLE: Duration = Duration::from_millis(1500);
+
+// Microsoft Entra ID pages that ask for input (sign-in, MFA, "stay signed in")
+// carry a page id in `$Config`; the automatic SAML response form does not.
+const INTERACTIVE_PAGE_SCRIPT: &str =
+    r#"typeof $Config === "object" && $Config !== null && typeof $Config.pgid === "string""#;
+
 enum BrowserEvent {
     Loaded(String),
     Open(String),
+    Interactive(bool),
     #[cfg(target_os = "macos")]
     DataStores(Vec<[u8; 16]>),
     #[cfg(target_os = "macos")]
@@ -89,6 +102,8 @@ pub(crate) fn authenticate_in_process(
     let window = WindowBuilder::new()
         .with_title("OpenConnect SSO")
         .with_inner_size(LogicalSize::new(900, 700))
+        // Stay hidden while an existing session completes authentication silently.
+        .with_visible(false)
         .build(&event_loop)
         .context("failed to create authentication window")?;
     let window_id = window.id();
@@ -127,9 +142,11 @@ pub(crate) fn authenticate_in_process(
         .build(&window)
         .context("failed to create authentication browser")?;
 
+    let script_proxy = event_loop.create_proxy();
     let mut window = Some(window);
     let mut webview = Some(webview);
     let mut result = None;
+    let mut reveal_at = Some(Instant::now() + REVEAL_AFTER_IDLE);
     event_loop.run_return(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -156,7 +173,28 @@ pub(crate) fn authenticate_in_process(
                     drop(webview.take());
                     drop(window.take());
                     *control_flow = ControlFlow::Exit;
+                    return;
                 }
+                if reveal_at.is_none() {
+                    return;
+                }
+                reveal_at = Some(Instant::now() + REVEAL_AFTER_IDLE);
+                if let Some(browser) = webview.as_ref() {
+                    let proxy = script_proxy.clone();
+                    // If the script cannot run, the idle timer still reveals the window.
+                    let _ = browser.evaluate_script_with_callback(
+                        INTERACTIVE_PAGE_SCRIPT,
+                        move |interactive| {
+                            let _ = proxy.send_event(BrowserEvent::Interactive(
+                                interactive.trim() == "true",
+                            ));
+                        },
+                    );
+                }
+            }
+            Event::UserEvent(BrowserEvent::Interactive(true)) if reveal_at.is_some() => {
+                reveal_at = None;
+                reveal(window.as_ref());
             }
             Event::WindowEvent {
                 window_id: closed_window,
@@ -170,6 +208,18 @@ pub(crate) fn authenticate_in_process(
             }
             _ => {}
         }
+
+        if matches!(*control_flow, ControlFlow::Exit) {
+            return;
+        }
+        match reveal_at {
+            Some(deadline) if Instant::now() >= deadline => {
+                reveal_at = None;
+                reveal(window.as_ref());
+            }
+            Some(deadline) => *control_flow = ControlFlow::WaitUntil(deadline),
+            None => {}
+        }
     });
 
     drop(webview);
@@ -179,6 +229,13 @@ pub(crate) fn authenticate_in_process(
     drop(event_loop);
 
     result.unwrap_or_else(|| Err(anyhow!("authentication browser exited unexpectedly")))
+}
+
+fn reveal(window: Option<&Window>) {
+    if let Some(window) = window {
+        window.set_visible(true);
+        window.set_focus();
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

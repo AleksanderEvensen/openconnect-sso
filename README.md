@@ -1,6 +1,6 @@
 # openconnect-sso
 
-Cisco AnyConnect SSO-v2 authentication for OpenConnect. It opens the VPN provider's web login in a persistent native browser, then starts OpenConnect with the resulting session.
+Cisco AnyConnect SSO-v2 authentication for OpenConnect. It runs the VPN provider's web login in a persistent native browser, then starts OpenConnect with the resulting session. The browser window stays hidden while an existing identity-provider session signs in silently, and appears as soon as the login page needs input.
 
 ## Requirements
 
